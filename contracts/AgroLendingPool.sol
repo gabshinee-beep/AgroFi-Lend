@@ -3,23 +3,26 @@ pragma solidity ^0.8.20;
 
 import "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import "@openzeppelin/contracts/utils/Pausable.sol";
-import "@openzeppelin/contracts/access/Ownable.sol";
+import "@openzeppelin/contracts/access/AccessControl.sol";
 import "@openzeppelin/contracts/token/ERC20/IERC20.sol";
 import "@openzeppelin/contracts/token/ERC1155/IERC1155.sol";
 import "@openzeppelin/contracts/token/ERC1155/utils/ERC1155Holder.sol";
 
-contract AgroLendingPool is ReentrancyGuard, Pausable, Ownable, ERC1155Holder {
+contract AgroLendingPool is ReentrancyGuard, Pausable, AccessControl, ERC1155Holder {
     
+    bytes32 public constant ADMIN_ROLE = keccak256("ADMIN_ROLE");
+    bytes32 public constant ORACLE_ROLE = keccak256("ORACLE_ROLE");
+
     IERC20 public immutable usdcToken;       
     IERC1155 public immutable agroToken;     
 
-    // 1 Fraccion = $500 USDC (Con 6 decimales)
     uint256 public constant VALOR_POR_FRACCION = 500 * 1e6; 
-    
-    // Intereses: 5% Anual
-    uint256 public constant INTEREST_RATE_BP = 500; // 500 bp = 5%
+    uint256 public constant INTEREST_RATE_BP = 500; 
     uint256 public constant SECONDS_PER_YEAR = 31536000;
     uint256 public constant BASIS_POINTS = 10000;
+    
+    uint256 public defaultLTV = 7000;
+    mapping(uint256 => uint256) public assetLTV;
 
     struct Loan {
         uint256 collateralAmount; 
@@ -29,29 +32,43 @@ contract AgroLendingPool is ReentrancyGuard, Pausable, Ownable, ERC1155Holder {
     }
 
     mapping(address => mapping(uint256 => Loan)) public loans;
-    uint256 public baseLTV = 7000; // 70%
 
     event LoanTaken(address indexed user, uint256 amount);
     event LoanRepaid(address indexed user, uint256 amount);
     event LoanLiquidated(address indexed user, address indexed liquidator);
+    event LTVUpdated(uint256 indexed assetId, uint256 newLTV);
 
-    constructor(address _usdc, address _agroToken) Ownable(msg.sender) {
+    constructor(address _usdc, address _agroToken) {
         usdcToken = IERC20(_usdc);
         agroToken = IERC1155(_agroToken);
+        _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
+        _grantRole(ADMIN_ROLE, msg.sender);
     }
 
-    // --- FUNCION PRINCIPAL: DEPOSITAR Y PEDIR ---
+    function getLTV(uint256 _assetId) public view returns (uint256) {
+        if (assetLTV[_assetId] > 0) {
+            return assetLTV[_assetId];
+        }
+        return defaultLTV;
+    }
+
+    function setAssetCustomLTV(uint256 _assetId, uint256 _newLTV) external onlyRole(ORACLE_ROLE) {
+        require(_newLTV <= 9000, "LTV muy alto (Max 90%)");
+        assetLTV[_assetId] = _newLTV;
+        emit LTVUpdated(_assetId, _newLTV);
+    }
+
     function depositAndBorrow(uint256 _assetId, uint256 _amountCollateral) external nonReentrant whenNotPaused {
         require(!loans[msg.sender][_assetId].isActive, "Prestamo activo existente");
+        require(_amountCollateral > 0, "Monto invalido");
         
-        // 1. Traer la garantia (RWA)
         agroToken.safeTransferFrom(msg.sender, address(this), _assetId, _amountCollateral, "");
 
-        // 2. Calcular cuanto prestar
         uint256 assetValue = _amountCollateral * VALOR_POR_FRACCION;
-        uint256 borrowAmount = (assetValue * baseLTV) / BASIS_POINTS;
+        uint256 currentLTV = getLTV(_assetId); 
+        
+        uint256 borrowAmount = (assetValue * currentLTV) / BASIS_POINTS;
 
-        // 3. Guardar datos
         loans[msg.sender][_assetId] = Loan({
             collateralAmount: _amountCollateral,
             principal: borrowAmount,
@@ -59,46 +76,37 @@ contract AgroLendingPool is ReentrancyGuard, Pausable, Ownable, ERC1155Holder {
             isActive: true
         });
 
-        // 4. Dar dinero
-        require(usdcToken.balanceOf(address(this)) >= borrowAmount, "Sin liquidez");
+        require(usdcToken.balanceOf(address(this)) >= borrowAmount, "Sin liquidez en Banco");
         usdcToken.transfer(msg.sender, borrowAmount);
         
         emit LoanTaken(msg.sender, borrowAmount);
     }
 
-    // --- FUNCION PAGAR ---
     function repayLoan(uint256 _assetId) external nonReentrant {
         Loan memory loan = loans[msg.sender][_assetId];
         require(loan.isActive, "No hay prestamo");
 
-        // Calcular Interes
         uint256 timeElapsed = block.timestamp - loan.startTime;
         uint256 interest = (loan.principal * INTEREST_RATE_BP * timeElapsed) / (SECONDS_PER_YEAR * BASIS_POINTS);
         uint256 totalDue = loan.principal + interest;
 
-        // Cobrar
         usdcToken.transferFrom(msg.sender, address(this), totalDue);
-
-        // Devolver Garantia
         agroToken.safeTransferFrom(address(this), msg.sender, _assetId, loan.collateralAmount, "");
 
         delete loans[msg.sender][_assetId];
         emit LoanRepaid(msg.sender, totalDue);
     }
 
-    // --- FUNCION LIQUIDAR (SIMPLIFICADA) ---
-    function liquidate(address _user, uint256 _assetId) external onlyOwner {
+    function liquidate(address _user, uint256 _assetId) external onlyRole(ADMIN_ROLE) {
         Loan memory loan = loans[_user][_assetId];
         require(loan.isActive, "No activo");
         
-        // En MVP, el admin se queda la garantia
         agroToken.safeTransferFrom(address(this), msg.sender, _assetId, loan.collateralAmount, "");
         delete loans[_user][_assetId];
         
         emit LoanLiquidated(_user, msg.sender);
     }
 
-    // Helper para el test
     function getTotalDue(address _user, uint256 _assetId) external view returns (uint256) {
         Loan memory loan = loans[_user][_assetId];
         if (!loan.isActive) return 0;
@@ -106,10 +114,9 @@ contract AgroLendingPool is ReentrancyGuard, Pausable, Ownable, ERC1155Holder {
         uint256 interest = (loan.principal * INTEREST_RATE_BP * timeElapsed) / (SECONDS_PER_YEAR * BASIS_POINTS);
         return loan.principal + interest;
     }
-    
-    // Helper para liquidacion
-    function checkHealth(address _user, uint256 _assetId) public view returns (bool) {
-         // Logica simplificada para el test: Siempre true a menos que forcemos liquidacion manual
-         return loans[_user][_assetId].isActive;
+
+    // --- CORRECCIÓN AQUÍ ABAJO (Línea 158) ---
+    function supportsInterface(bytes4 interfaceId) public view virtual override(AccessControl, ERC1155Holder) returns (bool) {
+        return super.supportsInterface(interfaceId);
     }
 }
