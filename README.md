@@ -24,7 +24,7 @@ En Perú, los pequeños agricultores enfrentan tasas de interés de hasta el 40%
 - **Chainlink**: Arquitectura de Oráculos para datos externos.
 - **ERC-1155**: Tokenización de activos agrícolas fraccionados.
 
-## 🔧 Instalación y Tests
+## Instalación y Tests
 ```bash
 npm install
 npx hardhat test
